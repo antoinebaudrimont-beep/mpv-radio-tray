@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import pathlib
+import signal
+import socket
+import subprocess
+import tempfile
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk
+
+
+CONFIG_DIR = pathlib.Path.home() / ".config" / "mpv-radio-tray"
+STATIONS_FILE = CONFIG_DIR / "stations.txt"
+
+CHECK_INTERVAL_SECONDS = 5
+STARTUP_GRACE_SECONDS = 12
+BUFFERING_RESTART_SECONDS = 35
+IPC_MISSING_RESTART_SECONDS = 25
+STALLED_PLAYBACK_RESTART_SECONDS = 60
+RESTART_COOLDOWN_SECONDS = 10
+
+player = None
+current_station = None
+started_at = 0.0
+last_restart_at = 0.0
+last_ipc_ok_at = 0.0
+last_time_pos = None
+last_time_pos_changed_at = 0.0
+time_pos_has_moved = False
+buffering_since = None
+ipc_path = None
+
+
+def runtime_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base:
+        return pathlib.Path(base)
+    return pathlib.Path(tempfile.gettempdir())
+
+
+def load_stations():
+    stations = []
+    if not STATIONS_FILE.exists():
+        return stations
+
+    for line in STATIONS_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "|" not in line:
+            continue
+        name, url = line.split("|", 1)
+        stations.append((name.strip(), url.strip()))
+
+    return stations
+
+
+def remove_ipc_socket():
+    if ipc_path:
+        try:
+            pathlib.Path(ipc_path).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def new_ipc_path():
+    return str(runtime_dir() / f"mpv-radio-tray-{os.getpid()}.sock")
+
+
+def stop_player():
+    global player
+
+    if player and player.poll() is None:
+        try:
+            os.killpg(player.pid, signal.SIGTERM)
+            player.wait(timeout=2)
+        except Exception:
+            try:
+                os.killpg(player.pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+    player = None
+    remove_ipc_socket()
+
+
+def stop_current_station():
+    global current_station
+
+    current_station = None
+    stop_player()
+
+
+def start_player(name, url):
+    global buffering_since
+    global ipc_path
+    global last_ipc_ok_at
+    global last_time_pos
+    global last_time_pos_changed_at
+    global player
+    global started_at
+    global time_pos_has_moved
+
+    remove_ipc_socket()
+    ipc_path = new_ipc_path()
+    now = time.monotonic()
+    started_at = now
+    last_ipc_ok_at = now
+    last_time_pos = None
+    last_time_pos_changed_at = now
+    time_pos_has_moved = False
+    buffering_since = None
+
+    player = subprocess.Popen(
+        [
+            "mpv",
+            "--no-video",
+            "--force-window=no",
+            "--quiet",
+            f"--input-ipc-server={ipc_path}",
+            "--network-timeout=15",
+            "--cache=yes",
+            url,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def play_station(name, url):
+    global current_station
+
+    current_station = (name, url)
+    stop_player()
+    start_player(name, url)
+
+
+def restart_current_station(reason):
+    global last_restart_at
+
+    if not current_station:
+        return
+
+    now = time.monotonic()
+    if now - last_restart_at < RESTART_COOLDOWN_SECONDS:
+        return
+
+    last_restart_at = now
+    name, url = current_station
+    stop_player()
+    start_player(name, url)
+
+
+def mpv_command(command):
+    if not ipc_path:
+        return None
+
+    request_id = int(time.monotonic() * 1000)
+    payload = json.dumps({"command": command, "request_id": request_id}).encode()
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            sock.connect(ipc_path)
+            sock.sendall(payload + b"\n")
+
+            buffer = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    return None
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if not line:
+                        continue
+                    response = json.loads(line.decode("utf-8"))
+                    if response.get("request_id") == request_id:
+                        return response
+    except Exception:
+        return None
+
+
+def mpv_property(name):
+    response = mpv_command(["get_property", name])
+    if not response or response.get("error") != "success":
+        return None
+    return response.get("data")
+
+
+def watchdog_tick():
+    global buffering_since
+    global last_ipc_ok_at
+    global last_time_pos
+    global last_time_pos_changed_at
+    global time_pos_has_moved
+
+    if not current_station:
+        return True
+
+    now = time.monotonic()
+
+    if not player or player.poll() is not None:
+        restart_current_station("mpv exited")
+        return True
+
+    paused_for_cache = mpv_property("paused-for-cache")
+    if paused_for_cache is None:
+        if now - started_at > STARTUP_GRACE_SECONDS and now - last_ipc_ok_at > IPC_MISSING_RESTART_SECONDS:
+            restart_current_station("mpv IPC unavailable")
+        return True
+
+    last_ipc_ok_at = now
+
+    if bool(paused_for_cache):
+        if buffering_since is None:
+            buffering_since = now
+        elif now - buffering_since >= BUFFERING_RESTART_SECONDS:
+            restart_current_station("buffering too long")
+    else:
+        buffering_since = None
+
+    if now - started_at > STARTUP_GRACE_SECONDS:
+        time_pos = mpv_property("time-pos")
+        if isinstance(time_pos, (int, float)):
+            if last_time_pos is None:
+                last_time_pos = time_pos
+                last_time_pos_changed_at = now
+            elif time_pos > last_time_pos + 0.25:
+                last_time_pos = time_pos
+                last_time_pos_changed_at = now
+                time_pos_has_moved = True
+            elif time_pos_has_moved and now - last_time_pos_changed_at >= STALLED_PLAYBACK_RESTART_SECONDS:
+                restart_current_station("playback time stalled")
+
+        core_idle = mpv_property("core-idle")
+        eof_reached = mpv_property("eof-reached")
+        if core_idle or eof_reached:
+            restart_current_station("stream ended or idle")
+
+    return True
+
+
+def quit_app(*args):
+    stop_player()
+    Gtk.main_quit()
+
+
+def build_menu():
+    menu = Gtk.Menu()
+
+    title = Gtk.MenuItem(label="mpv Radio Tray")
+    title.set_sensitive(False)
+    menu.append(title)
+
+    menu.append(Gtk.SeparatorMenuItem())
+
+    stations = load_stations()
+
+    if not stations:
+        item = Gtk.MenuItem(label="No stations configured")
+        item.set_sensitive(False)
+        menu.append(item)
+    else:
+        for name, url in stations:
+            item = Gtk.MenuItem(label=name)
+            item.connect("activate", lambda _item, n=name, u=url: play_station(n, u))
+            menu.append(item)
+
+    menu.append(Gtk.SeparatorMenuItem())
+
+    stop = Gtk.MenuItem(label="Stop")
+    stop.connect("activate", lambda _item: stop_current_station())
+    menu.append(stop)
+
+    quit_item = Gtk.MenuItem(label="Quit")
+    quit_item.connect("activate", quit_app)
+    menu.append(quit_item)
+
+    menu.show_all()
+    return menu
+
+
+def start_indicator():
+    try:
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+
+        indicator = AppIndicator3.Indicator.new(
+            "mpv-radio-tray",
+            "multimedia-player",
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        indicator.set_menu(build_menu())
+        return indicator
+
+    except Exception:
+        icon = Gtk.StatusIcon()
+        icon.set_from_icon_name("multimedia-player")
+        icon.set_tooltip_text("mpv Radio Tray")
+        icon.set_visible(True)
+
+        def popup(_icon, button, activate_time):
+            build_menu().popup(None, None, None, None, button, activate_time)
+
+        icon.connect("popup-menu", popup)
+        icon.connect(
+            "activate",
+            lambda _icon: build_menu().popup(
+                None,
+                None,
+                None,
+                None,
+                0,
+                Gtk.get_current_event_time(),
+            ),
+        )
+        return icon
+
+
+signal.signal(signal.SIGINT, quit_app)
+signal.signal(signal.SIGTERM, quit_app)
+
+tray = start_indicator()
+GLib.timeout_add_seconds(CHECK_INTERVAL_SECONDS, watchdog_tick)
+Gtk.main()

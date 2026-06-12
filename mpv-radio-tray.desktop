@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=mpv Radio Tray
+Comment=Tiny mpv-backed internet radio tray app
+Exec=mpv-radio-tray
+Icon=multimedia-player
+Terminal=false
+Categories=Audio;Player;
