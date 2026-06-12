@@ -41,6 +41,28 @@ chmod 644 ~/.local/share/applications/mpv-radio-tray.desktop
 xfce4-panel -r
 ```
 
+### Create an XFCE launcher
+
+On XFCE, you can create the application launcher file manually with:
+
+```bash
+mkdir -p ~/.local/share/applications
+
+cat > ~/.local/share/applications/mpv-radio-tray.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=mpv Radio Tray
+Comment=Small radio tray player using mpv
+Exec=$HOME/.local/bin/mpv-radio-tray
+Icon=multimedia-player
+Terminal=false
+Categories=Audio;Player;
+StartupNotify=false
+EOF
+chmod 644 ~/.local/share/applications/mpv-radio-tray.desktop
+xfce4-panel -r
+```
+
 Make sure `~/.local/bin` is in your `PATH`, then start:
 
 ```bash
