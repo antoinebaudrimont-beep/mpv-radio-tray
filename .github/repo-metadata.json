@@ -1,0 +1,15 @@
+{
+  "description": "Lightweight GTK tray application for streaming live radio on Linux. Uses mpv as the playback backend with automatic stream recovery, Bluetooth audio output support, and custom station configuration.",
+  "topics": [
+    "mpv",
+    "radio-player",
+    "gtk",
+    "tray-application",
+    "streaming",
+    "linux",
+    "xfce",
+    "audio-player",
+    "python",
+    "multimedia"
+  ]
+}
