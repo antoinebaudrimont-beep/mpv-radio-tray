@@ -1,8 +1,11 @@
 # mpv Radio Tray
 
-Tiny GTK tray app for live radio streams on MX Linux Xfce. It uses `mpv` as
-the playback backend and restarts only the `mpv` child process if a stream
-buffers for too long, exits, or becomes idle.
+Lightweight GTK tray application for streaming live radio on Linux. Uses `mpv`
+as the playback backend with automatic stream recovery, Bluetooth audio output
+support, and custom station configuration.
+
+Tags: `mpv`, `radio-player`, `gtk`, `tray-application`, `streaming`, `linux`,
+`xfce`, `audio-player`, `python`, `multimedia`
 
 **Tags:** `#mpv` `#radio-player` `#gtk` `#tray-application` `#streaming` `#linux` `#xfce`
 
