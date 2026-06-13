@@ -7,7 +7,7 @@ buffers for too long, exits, or becomes idle.
 ## Install dependencies
 
 ```bash
-sudo apt install mpv python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1
+sudo apt install mpv python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 bluez pulseaudio-utils
 ```
 
 ## Install locally
@@ -84,6 +84,21 @@ Station name|https://example.com/stream
 ```
 
 For RadioJar streams, keep the clean URL rather than redirected token URLs.
+
+## Output
+
+Use the tray menu's `Output` submenu to switch between the computer's normal
+audio sink and Bluetooth devices known to `bluetoothctl`.
+
+Bluetooth devices must already be paired or otherwise listed by:
+
+```bash
+bluetoothctl devices
+```
+
+When you choose a Bluetooth device, the app asks `bluetoothctl` to connect to it,
+waits for the matching audio sink, then tells `mpv` to use that sink. The same
+output is reused when the current station is restarted.
 
 ## Recovery behavior
 

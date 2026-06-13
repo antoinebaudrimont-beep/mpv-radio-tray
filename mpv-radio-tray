@@ -7,6 +7,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 
 import gi
@@ -24,9 +25,11 @@ BUFFERING_RESTART_SECONDS = 35
 IPC_MISSING_RESTART_SECONDS = 25
 STALLED_PLAYBACK_RESTART_SECONDS = 60
 RESTART_COOLDOWN_SECONDS = 10
+BLUETOOTH_CONNECT_TIMEOUT_SECONDS = 12
 
 player = None
 current_station = None
+selected_audio_device = None
 started_at = 0.0
 last_restart_at = 0.0
 last_ipc_ok_at = 0.0
@@ -117,17 +120,21 @@ def start_player(name, url):
     time_pos_has_moved = False
     buffering_since = None
 
+    command = [
+        "mpv",
+        "--no-video",
+        "--force-window=no",
+        "--quiet",
+        f"--input-ipc-server={ipc_path}",
+        "--network-timeout=15",
+        "--cache=yes",
+    ]
+    if selected_audio_device:
+        command.append(f"--audio-device={selected_audio_device}")
+    command.append(url)
+
     player = subprocess.Popen(
-        [
-            "mpv",
-            "--no-video",
-            "--force-window=no",
-            "--quiet",
-            f"--input-ipc-server={ipc_path}",
-            "--network-timeout=15",
-            "--cache=yes",
-            url,
-        ],
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -194,6 +201,140 @@ def mpv_property(name):
     if not response or response.get("error") != "success":
         return None
     return response.get("data")
+
+
+def run_command(command, timeout=3):
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    return completed.stdout
+
+
+def pactl_sinks():
+    output = run_command(["pactl", "-f", "json", "list", "sinks"])
+    if output:
+        try:
+            sinks = json.loads(output)
+            return [
+                {
+                    "name": sink.get("name", ""),
+                    "description": sink.get("description", sink.get("name", "")),
+                }
+                for sink in sinks
+                if sink.get("name")
+            ]
+        except json.JSONDecodeError:
+            pass
+
+    output = run_command(["pactl", "list", "short", "sinks"])
+    if not output:
+        return []
+
+    sinks = []
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            sinks.append({"name": parts[1], "description": parts[1]})
+    return sinks
+
+
+def is_bluetooth_sink(sink_name):
+    return sink_name.startswith("bluez_") or ".bluez" in sink_name
+
+
+def default_sink_name():
+    output = run_command(["pactl", "get-default-sink"])
+    if not output:
+        return None
+    return output.strip() or None
+
+
+def computer_sink_name():
+    current = default_sink_name()
+    if current and not is_bluetooth_sink(current):
+        return current
+
+    for sink in pactl_sinks():
+        name = sink["name"]
+        if not is_bluetooth_sink(name):
+            return name
+
+    return None
+
+
+def bluetooth_devices():
+    output = run_command(["bluetoothctl", "devices"])
+    if not output:
+        return []
+
+    devices = []
+    for line in output.splitlines():
+        parts = line.strip().split(" ", 2)
+        if len(parts) == 3 and parts[0] == "Device":
+            devices.append((parts[1], parts[2]))
+    return devices
+
+
+def bluetooth_sink_name(address):
+    address_part = address.replace(":", "_").upper()
+    matches = [
+        sink["name"]
+        for sink in pactl_sinks()
+        if sink["name"].startswith(f"bluez_output.{address_part}.")
+    ]
+    if not matches:
+        return None
+
+    for name in matches:
+        if "a2dp" in name.lower():
+            return name
+
+    return matches[0]
+
+
+def set_output_sink(sink_name):
+    global selected_audio_device
+
+    selected_audio_device = f"pulse/{sink_name}"
+    run_command(["pactl", "set-default-sink", sink_name])
+
+    if current_station:
+        mpv_command(["set_property", "audio-device", selected_audio_device])
+
+
+def select_computer_output():
+    sink_name = computer_sink_name()
+    if sink_name:
+        set_output_sink(sink_name)
+
+
+def select_bluetooth_output(address):
+    run_command(["bluetoothctl", "connect", address], timeout=BLUETOOTH_CONNECT_TIMEOUT_SECONDS)
+
+    deadline = time.monotonic() + BLUETOOTH_CONNECT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        sink_name = bluetooth_sink_name(address)
+        if sink_name:
+            set_output_sink(sink_name)
+            return
+        time.sleep(0.5)
+
+
+def run_in_background(function, *args):
+    thread = threading.Thread(target=function, args=args, daemon=True)
+    thread.start()
 
 
 def watchdog_tick():
@@ -274,6 +415,34 @@ def build_menu():
             item = Gtk.MenuItem(label=name)
             item.connect("activate", lambda _item, n=name, u=url: play_station(n, u))
             menu.append(item)
+
+    menu.append(Gtk.SeparatorMenuItem())
+
+    output_item = Gtk.MenuItem(label="Output")
+    output_menu = Gtk.Menu()
+
+    computer_item = Gtk.MenuItem(label="Computer")
+    computer_item.connect("activate", lambda _item: run_in_background(select_computer_output))
+    output_menu.append(computer_item)
+
+    output_menu.append(Gtk.SeparatorMenuItem())
+
+    devices = bluetooth_devices()
+    if not devices:
+        no_devices_item = Gtk.MenuItem(label="No Bluetooth devices listed")
+        no_devices_item.set_sensitive(False)
+        output_menu.append(no_devices_item)
+    else:
+        for address, name in devices:
+            device_item = Gtk.MenuItem(label=name)
+            device_item.connect(
+                "activate",
+                lambda _item, a=address: run_in_background(select_bluetooth_output, a),
+            )
+            output_menu.append(device_item)
+
+    output_item.set_submenu(output_menu)
+    menu.append(output_item)
 
     menu.append(Gtk.SeparatorMenuItem())
 
