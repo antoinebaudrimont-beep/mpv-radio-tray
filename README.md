@@ -67,6 +67,7 @@ For RadioJar streams, keep the clean URL rather than redirected token URLs.
 
 Use the tray menu's `Output` submenu to switch between the computer's normal
 audio sink and Bluetooth devices known to `bluetoothctl`.
+The selected output is marked with a dot drawn in the current GTK theme color.
 
 Bluetooth devices must already be paired or otherwise listed by:
 

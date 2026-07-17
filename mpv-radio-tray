@@ -39,6 +39,7 @@ time_pos_has_moved = False
 buffering_since = None
 ipc_path = None
 station_menu_items = []
+output_menu_items = []
 
 
 def runtime_dir():
@@ -314,6 +315,31 @@ def bluetooth_sink_name(address):
     return matches[0]
 
 
+def selected_sink_name():
+    pulse_prefix = "pulse/"
+    if selected_audio_device and selected_audio_device.startswith(pulse_prefix):
+        return selected_audio_device[len(pulse_prefix) :]
+    return default_sink_name()
+
+
+def update_output_menu_state():
+    sink_name = selected_sink_name()
+
+    for item, address in output_menu_items:
+        if not sink_name:
+            is_selected = False
+        elif address is None:
+            is_selected = not is_bluetooth_sink(sink_name)
+        else:
+            address_part = address.replace(":", "_").upper()
+            is_selected = sink_name.startswith(f"bluez_output.{address_part}.")
+
+        if item.get_active() != is_selected:
+            item.set_active(is_selected)
+
+    return False
+
+
 def set_output_sink(sink_name):
     global selected_audio_device
 
@@ -322,6 +348,8 @@ def set_output_sink(sink_name):
 
     if current_station:
         mpv_command(["set_property", "audio-device", selected_audio_device])
+
+    GLib.idle_add(update_output_menu_state)
 
 
 def select_computer_output():
@@ -345,6 +373,11 @@ def select_bluetooth_output(address):
 def run_in_background(function, *args):
     thread = threading.Thread(target=function, args=args, daemon=True)
     thread.start()
+
+
+def select_output_in_background(function, *args):
+    GLib.idle_add(update_output_menu_state)
+    run_in_background(function, *args)
 
 
 def watchdog_tick():
@@ -406,9 +439,11 @@ def quit_app(*args):
 
 
 def build_menu():
+    global output_menu_items
     global station_menu_items
 
     menu = Gtk.Menu()
+    output_menu_items = []
     station_menu_items = []
 
     title = Gtk.MenuItem(label="mpv Radio Tray")
@@ -437,8 +472,13 @@ def build_menu():
     output_item = Gtk.MenuItem(label="Output")
     output_menu = Gtk.Menu()
 
-    computer_item = Gtk.MenuItem(label="Computer")
-    computer_item.connect("activate", lambda _item: run_in_background(select_computer_output))
+    computer_item = Gtk.CheckMenuItem(label="Computer")
+    computer_item.set_draw_as_radio(True)
+    computer_item.connect(
+        "activate",
+        lambda _item: select_output_in_background(select_computer_output),
+    )
+    output_menu_items.append((computer_item, None))
     output_menu.append(computer_item)
 
     output_menu.append(Gtk.SeparatorMenuItem())
@@ -450,13 +490,17 @@ def build_menu():
         output_menu.append(no_devices_item)
     else:
         for address, name in devices:
-            device_item = Gtk.MenuItem(label=name)
+            device_item = Gtk.CheckMenuItem(label=name)
+            device_item.set_draw_as_radio(True)
             device_item.connect(
                 "activate",
-                lambda _item, a=address: run_in_background(select_bluetooth_output, a),
+                lambda _item, a=address: select_output_in_background(select_bluetooth_output, a),
             )
+            output_menu_items.append((device_item, address))
             output_menu.append(device_item)
 
+    output_menu.connect("show", lambda _menu: update_output_menu_state())
+    update_output_menu_state()
     output_item.set_submenu(output_menu)
     menu.append(output_item)
 
