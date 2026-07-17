@@ -25,7 +25,6 @@ BUFFERING_RESTART_SECONDS = 35
 IPC_MISSING_RESTART_SECONDS = 25
 STALLED_PLAYBACK_RESTART_SECONDS = 60
 RESTART_COOLDOWN_SECONDS = 10
-BLUETOOTH_CONNECT_TIMEOUT_SECONDS = 12
 
 player = None
 current_station = None
@@ -40,6 +39,7 @@ buffering_since = None
 ipc_path = None
 station_menu_items = []
 output_menu_items = []
+updating_output_menu = False
 
 
 def runtime_dir():
@@ -323,19 +323,25 @@ def selected_sink_name():
 
 
 def update_output_menu_state():
+    global updating_output_menu
+
     sink_name = selected_sink_name()
+    updating_output_menu = True
 
-    for item, address in output_menu_items:
-        if not sink_name:
-            is_selected = False
-        elif address is None:
-            is_selected = not is_bluetooth_sink(sink_name)
-        else:
-            address_part = address.replace(":", "_").upper()
-            is_selected = sink_name.startswith(f"bluez_output.{address_part}.")
+    try:
+        for item, address in output_menu_items:
+            if not sink_name:
+                is_selected = False
+            elif address is None:
+                is_selected = not is_bluetooth_sink(sink_name)
+            else:
+                address_part = address.replace(":", "_").upper()
+                is_selected = sink_name.startswith(f"bluez_output.{address_part}.")
 
-        if item.get_active() != is_selected:
-            item.set_active(is_selected)
+            if item.get_active() != is_selected:
+                item.set_active(is_selected)
+    finally:
+        updating_output_menu = False
 
     return False
 
@@ -344,7 +350,6 @@ def set_output_sink(sink_name):
     global selected_audio_device
 
     selected_audio_device = f"pulse/{sink_name}"
-    run_command(["pactl", "set-default-sink", sink_name])
 
     if current_station:
         mpv_command(["set_property", "audio-device", selected_audio_device])
@@ -359,15 +364,9 @@ def select_computer_output():
 
 
 def select_bluetooth_output(address):
-    run_command(["bluetoothctl", "connect", address], timeout=BLUETOOTH_CONNECT_TIMEOUT_SECONDS)
-
-    deadline = time.monotonic() + BLUETOOTH_CONNECT_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        sink_name = bluetooth_sink_name(address)
-        if sink_name:
-            set_output_sink(sink_name)
-            return
-        time.sleep(0.5)
+    sink_name = bluetooth_sink_name(address)
+    if sink_name:
+        set_output_sink(sink_name)
 
 
 def run_in_background(function, *args):
@@ -376,6 +375,9 @@ def run_in_background(function, *args):
 
 
 def select_output_in_background(function, *args):
+    if updating_output_menu:
+        return
+
     GLib.idle_add(update_output_menu_state)
     run_in_background(function, *args)
 
