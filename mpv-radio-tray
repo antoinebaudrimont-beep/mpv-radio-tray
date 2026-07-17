@@ -38,6 +38,7 @@ last_time_pos_changed_at = 0.0
 time_pos_has_moved = False
 buffering_since = None
 ipc_path = None
+station_menu_items = []
 
 
 def runtime_dir():
@@ -98,6 +99,7 @@ def stop_current_station():
 
     current_station = None
     stop_player()
+    update_station_menu_state()
 
 
 def start_player(name, url):
@@ -148,6 +150,14 @@ def play_station(name, url):
     current_station = (name, url)
     stop_player()
     start_player(name, url)
+    update_station_menu_state()
+
+
+def update_station_menu_state():
+    for item, name, url in station_menu_items:
+        is_current = current_station == (name, url)
+        if item.get_active() != is_current:
+            item.set_active(is_current)
 
 
 def restart_current_station(reason):
@@ -396,7 +406,10 @@ def quit_app(*args):
 
 
 def build_menu():
+    global station_menu_items
+
     menu = Gtk.Menu()
+    station_menu_items = []
 
     title = Gtk.MenuItem(label="mpv Radio Tray")
     title.set_sensitive(False)
@@ -412,8 +425,11 @@ def build_menu():
         menu.append(item)
     else:
         for name, url in stations:
-            item = Gtk.MenuItem(label=name)
+            item = Gtk.CheckMenuItem(label=name)
+            item.set_draw_as_radio(True)
+            item.set_active(current_station == (name, url))
             item.connect("activate", lambda _item, n=name, u=url: play_station(n, u))
+            station_menu_items.append((item, name, url))
             menu.append(item)
 
     menu.append(Gtk.SeparatorMenuItem())
