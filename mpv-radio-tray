@@ -161,6 +161,13 @@ def update_station_menu_state():
             item.set_active(is_current)
 
 
+def activate_station_menu_item(item, name, url):
+    if item.get_active():
+        play_station(name, url)
+    elif current_station == (name, url):
+        item.set_active(True)
+
+
 def restart_current_station(reason):
     global last_restart_at
 
@@ -465,7 +472,10 @@ def build_menu():
             item = Gtk.CheckMenuItem(label=name)
             item.set_draw_as_radio(True)
             item.set_active(current_station == (name, url))
-            item.connect("activate", lambda _item, n=name, u=url: play_station(n, u))
+            item.connect(
+                "activate",
+                lambda menu_item, n=name, u=url: activate_station_menu_item(menu_item, n, u),
+            )
             station_menu_items.append((item, name, url))
             menu.append(item)
 
@@ -558,9 +568,15 @@ def start_indicator():
         return icon
 
 
-signal.signal(signal.SIGINT, quit_app)
-signal.signal(signal.SIGTERM, quit_app)
+def main():
+    signal.signal(signal.SIGINT, quit_app)
+    signal.signal(signal.SIGTERM, quit_app)
 
-tray = start_indicator()
-GLib.timeout_add_seconds(CHECK_INTERVAL_SECONDS, watchdog_tick)
-Gtk.main()
+    tray = start_indicator()
+    GLib.timeout_add_seconds(CHECK_INTERVAL_SECONDS, watchdog_tick)
+    Gtk.main()
+    return tray
+
+
+if __name__ == "__main__":
+    main()
