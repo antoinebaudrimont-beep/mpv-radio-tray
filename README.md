@@ -75,12 +75,12 @@ Bluetooth devices must already be paired or otherwise listed by:
 bluetoothctl devices
 ```
 
-The desktop remains responsible for connecting Bluetooth devices and choosing
-the system-wide default output. The tray app routes only `mpv`, so selecting
-`Computer` does not disconnect or reconnect Bluetooth and does not change audio
-for other applications. A Bluetooth device must already be connected and have
-an available audio sink before the tray app can select it. The selected output
-is reused when the current station is restarted.
+When you choose a Bluetooth device, the app asks `bluetoothctl` to connect to
+it, waits for the matching audio sink, then tells `mpv` to use that sink. The
+device must already be paired, and some desktops may require it to be trusted.
+The tray app routes only `mpv`; it does not change the system-wide default
+output or the audio used by other applications. The selected output is reused
+when the current station is restarted.
 
 ## Recovery behavior
 
