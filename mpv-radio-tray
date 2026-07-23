@@ -25,6 +25,7 @@ BUFFERING_RESTART_SECONDS = 35
 IPC_MISSING_RESTART_SECONDS = 25
 STALLED_PLAYBACK_RESTART_SECONDS = 60
 RESTART_COOLDOWN_SECONDS = 10
+BLUETOOTH_CONNECT_TIMEOUT_SECONDS = 12
 
 player = None
 current_station = None
@@ -371,9 +372,18 @@ def select_computer_output():
 
 
 def select_bluetooth_output(address):
-    sink_name = bluetooth_sink_name(address)
-    if sink_name:
-        set_output_sink(sink_name)
+    run_command(
+        ["bluetoothctl", "connect", address],
+        timeout=BLUETOOTH_CONNECT_TIMEOUT_SECONDS,
+    )
+
+    deadline = time.monotonic() + BLUETOOTH_CONNECT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        sink_name = bluetooth_sink_name(address)
+        if sink_name:
+            set_output_sink(sink_name)
+            return
+        time.sleep(0.5)
 
 
 def run_in_background(function, *args):
