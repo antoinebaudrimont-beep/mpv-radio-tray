@@ -84,9 +84,13 @@ when the current station is restarted.
 
 ## Recovery behavior
 
-The app launches mpv with a private IPC socket and checks it every five
-seconds. If mpv reports `paused-for-cache` for 35 seconds, exits, reaches EOF,
-stops responding through IPC, or reports playback time that moved and then
-stalled for 60 seconds, the tray app restarts the same station.
+The app gives its audio-only mpv process a 16 MiB forward cache and a 1 MiB
+back cache, without changing the user's global mpv configuration.
+
+It checks mpv's private IPC socket every five seconds without blocking the tray
+UI. If mpv reports `paused-for-cache` continuously for 25 seconds, exits,
+reaches EOF, stops responding through IPC, or reports playback time that moved
+and then stalled for 30 seconds, the tray app restarts the same station. A
+30-second restart cooldown prevents rapid restart loops.
 
 The tray process is not restarted, so the selected station is preserved.
