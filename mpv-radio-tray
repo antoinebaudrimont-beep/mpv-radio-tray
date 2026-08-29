@@ -1,14 +1,56 @@
 #!/usr/bin/env python3
 
+import ctypes
 import json
 import os
 import pathlib
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+
+
+MPV_CHILD_MODE = "--mpv-child-with-parent-death-signal"
+PR_SET_PDEATHSIG = 1
+
+
+def set_parent_death_signal(expected_parent_pid):
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    if prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+    if os.getppid() != expected_parent_pid:
+        os._exit(1)
+
+
+def run_mpv_child_launcher(arguments):
+    if len(arguments) < 2:
+        raise SystemExit("missing parent PID or mpv command")
+
+    expected_parent_pid = int(arguments[0])
+    command = arguments[1:]
+    set_parent_death_signal(expected_parent_pid)
+    os.execvp(command[0], command)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == MPV_CHILD_MODE:
+    run_mpv_child_launcher(sys.argv[2:])
 
 import gi
 
@@ -21,23 +63,24 @@ STATIONS_FILE = CONFIG_DIR / "stations.txt"
 
 CHECK_INTERVAL_SECONDS = 5
 STARTUP_GRACE_SECONDS = 12
-BUFFERING_RESTART_SECONDS = 35
+BUFFERING_RESTART_SECONDS = 25
 IPC_MISSING_RESTART_SECONDS = 25
-STALLED_PLAYBACK_RESTART_SECONDS = 60
-RESTART_COOLDOWN_SECONDS = 10
+STALLED_PLAYBACK_RESTART_SECONDS = 30
+RESTART_COOLDOWN_SECONDS = 30
 BLUETOOTH_CONNECT_TIMEOUT_SECONDS = 12
 
 player = None
 current_station = None
 selected_audio_device = None
 started_at = 0.0
-last_restart_at = 0.0
+last_restart_at = None
 last_ipc_ok_at = 0.0
 last_time_pos = None
 last_time_pos_changed_at = 0.0
 time_pos_has_moved = False
 buffering_since = None
 ipc_path = None
+watchdog_check_in_progress = False
 station_menu_items = []
 output_menu_items = []
 updating_output_menu = False
@@ -91,6 +134,10 @@ def stop_player():
                 os.killpg(player.pid, signal.SIGKILL)
             except Exception:
                 pass
+            try:
+                player.wait(timeout=2)
+            except Exception:
+                pass
 
     player = None
     remove_ipc_socket()
@@ -132,13 +179,23 @@ def start_player(name, url):
         f"--input-ipc-server={ipc_path}",
         "--network-timeout=15",
         "--cache=yes",
+        "--demuxer-max-bytes=16M",
+        "--demuxer-max-back-bytes=1M",
+        "--demuxer-readahead-secs=10",
     ]
     if selected_audio_device:
         command.append(f"--audio-device={selected_audio_device}")
     command.append(url)
 
+    child_command = [
+        sys.executable,
+        os.path.abspath(__file__),
+        MPV_CHILD_MODE,
+        str(os.getpid()),
+        *command,
+    ]
     player = subprocess.Popen(
-        command,
+        child_command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -148,8 +205,10 @@ def start_player(name, url):
 
 def play_station(name, url):
     global current_station
+    global last_restart_at
 
     current_station = (name, url)
+    last_restart_at = None
     stop_player()
     start_player(name, url)
     update_station_menu_state()
@@ -176,7 +235,7 @@ def restart_current_station(reason):
         return
 
     now = time.monotonic()
-    if now - last_restart_at < RESTART_COOLDOWN_SECONDS:
+    if last_restart_at is not None and now - last_restart_at < RESTART_COOLDOWN_SECONDS:
         return
 
     last_restart_at = now
@@ -185,8 +244,9 @@ def restart_current_station(reason):
     start_player(name, url)
 
 
-def mpv_command(command):
-    if not ipc_path:
+def mpv_command(command, socket_path=None):
+    target_path = ipc_path if socket_path is None else socket_path
+    if not target_path:
         return None
 
     request_id = int(time.monotonic() * 1000)
@@ -195,7 +255,7 @@ def mpv_command(command):
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(1.0)
-            sock.connect(ipc_path)
+            sock.connect(target_path)
             sock.sendall(payload + b"\n")
 
             buffer = b""
@@ -215,8 +275,8 @@ def mpv_command(command):
         return None
 
 
-def mpv_property(name):
-    response = mpv_command(["get_property", name])
+def mpv_property(name, socket_path=None):
+    response = mpv_command(["get_property", name], socket_path)
     if not response or response.get("error") != "success":
         return None
     return response.get("data")
@@ -399,55 +459,134 @@ def select_output_in_background(function, *args):
     run_in_background(function, *args)
 
 
-def watchdog_tick():
+def read_watchdog_status(socket_path, include_playback_status):
+    paused_response = mpv_command(
+        ["get_property", "paused-for-cache"],
+        socket_path,
+    )
+    status = {
+        "ipc_ok": paused_response is not None,
+        "paused_for_cache": None,
+        "time_pos": None,
+        "eof_reached": None,
+    }
+
+    if paused_response and paused_response.get("error") == "success":
+        status["paused_for_cache"] = paused_response.get("data")
+
+    if status["ipc_ok"] and include_playback_status:
+        status["time_pos"] = mpv_property("time-pos", socket_path)
+        status["eof_reached"] = mpv_property("eof-reached", socket_path)
+
+    return status
+
+
+def check_watchdog_status(monitored_player, monitored_ipc_path, include_playback_status):
+    global watchdog_check_in_progress
+
+    try:
+        status = read_watchdog_status(monitored_ipc_path, include_playback_status)
+    except Exception:
+        status = None
+    try:
+        GLib.idle_add(
+            apply_watchdog_status,
+            monitored_player,
+            monitored_ipc_path,
+            status,
+        )
+    except Exception:
+        watchdog_check_in_progress = False
+
+
+def apply_watchdog_status(monitored_player, monitored_ipc_path, status):
     global buffering_since
     global last_ipc_ok_at
     global last_time_pos
     global last_time_pos_changed_at
     global time_pos_has_moved
+    global watchdog_check_in_progress
+
+    watchdog_check_in_progress = False
+
+    if (
+        not current_station
+        or player is not monitored_player
+        or ipc_path != monitored_ipc_path
+    ):
+        return False
+
+    if status is None:
+        return False
+
+    if player.poll() is not None:
+        restart_current_station("mpv exited")
+        return False
+
+    now = time.monotonic()
+
+    if not status["ipc_ok"]:
+        if (
+            now - started_at > STARTUP_GRACE_SECONDS
+            and now - last_ipc_ok_at > IPC_MISSING_RESTART_SECONDS
+        ):
+            restart_current_station("mpv IPC unavailable")
+        return False
+
+    last_ipc_ok_at = now
+
+    paused_for_cache = status["paused_for_cache"]
+    if paused_for_cache:
+        if buffering_since is None:
+            buffering_since = now
+        elif now - buffering_since >= BUFFERING_RESTART_SECONDS:
+            restart_current_station("buffering too long")
+            return False
+    elif paused_for_cache is False:
+        buffering_since = None
+
+    time_pos = status["time_pos"]
+    if isinstance(time_pos, (int, float)):
+        if last_time_pos is None:
+            last_time_pos = time_pos
+            last_time_pos_changed_at = now
+        elif abs(time_pos - last_time_pos) > 0.25:
+            last_time_pos = time_pos
+            last_time_pos_changed_at = now
+            time_pos_has_moved = True
+        elif (
+            time_pos_has_moved
+            and now - last_time_pos_changed_at >= STALLED_PLAYBACK_RESTART_SECONDS
+        ):
+            restart_current_station("playback time stalled")
+            return False
+
+    if status["eof_reached"]:
+        restart_current_station("stream ended")
+
+    return False
+
+
+def watchdog_tick():
+    global watchdog_check_in_progress
 
     if not current_station:
         return True
-
-    now = time.monotonic()
 
     if not player or player.poll() is not None:
         restart_current_station("mpv exited")
         return True
 
-    paused_for_cache = mpv_property("paused-for-cache")
-    if paused_for_cache is None:
-        if now - started_at > STARTUP_GRACE_SECONDS and now - last_ipc_ok_at > IPC_MISSING_RESTART_SECONDS:
-            restart_current_station("mpv IPC unavailable")
+    if watchdog_check_in_progress:
         return True
 
-    last_ipc_ok_at = now
-
-    if bool(paused_for_cache):
-        if buffering_since is None:
-            buffering_since = now
-        elif now - buffering_since >= BUFFERING_RESTART_SECONDS:
-            restart_current_station("buffering too long")
-    else:
-        buffering_since = None
-
-    if now - started_at > STARTUP_GRACE_SECONDS:
-        time_pos = mpv_property("time-pos")
-        if isinstance(time_pos, (int, float)):
-            if last_time_pos is None:
-                last_time_pos = time_pos
-                last_time_pos_changed_at = now
-            elif time_pos > last_time_pos + 0.25:
-                last_time_pos = time_pos
-                last_time_pos_changed_at = now
-                time_pos_has_moved = True
-            elif time_pos_has_moved and now - last_time_pos_changed_at >= STALLED_PLAYBACK_RESTART_SECONDS:
-                restart_current_station("playback time stalled")
-
-        core_idle = mpv_property("core-idle")
-        eof_reached = mpv_property("eof-reached")
-        if core_idle or eof_reached:
-            restart_current_station("stream ended or idle")
+    watchdog_check_in_progress = True
+    run_in_background(
+        check_watchdog_status,
+        player,
+        ipc_path,
+        time.monotonic() - started_at > STARTUP_GRACE_SECONDS,
+    )
 
     return True
 
@@ -455,6 +594,7 @@ def watchdog_tick():
 def quit_app(*args):
     stop_player()
     Gtk.main_quit()
+    return False
 
 
 def build_menu():
@@ -579,12 +719,15 @@ def start_indicator():
 
 
 def main():
-    signal.signal(signal.SIGINT, quit_app)
-    signal.signal(signal.SIGTERM, quit_app)
+    for signal_number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal_number, quit_app)
 
     tray = start_indicator()
     GLib.timeout_add_seconds(CHECK_INTERVAL_SECONDS, watchdog_tick)
-    Gtk.main()
+    try:
+        Gtk.main()
+    finally:
+        stop_player()
     return tray
 
 
