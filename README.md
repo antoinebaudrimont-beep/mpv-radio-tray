@@ -1,16 +1,37 @@
-# mpv Radio Tray
+# MPV Radio Tray
 
-Lightweight GTK tray application for streaming live radio on Linux. Uses mpv as the playback backend with automatic stream recovery, Bluetooth audio output support, and custom station configuration.
+A lightweight tray/menu-bar internet radio player for Linux and macOS.
 
-Tags: mpv, radio-player, gtk, tray-application, streaming, linux, xfce, audio-player, python, multimedia
+## Platforms
 
-## Install dependencies
+| Feature | Linux | macOS |
+| --- | --- | --- |
+| UI | GTK tray | Native AppKit menu bar |
+| Language | Python | Swift |
+| Playback | External mpv process | AVFoundation / AVPlayer |
+| mpv dependency | Yes | No |
+| Radio recovery | mpv IPC watchdog | AVFoundation observations and watchdog |
+| Bluetooth | BlueZ and the Linux audio stack | macOS system audio and pairing |
+| AirPlay | No dedicated integration | Native Apple route picker; receiver support varies |
+| Station config | `~/.config/mpv-radio-tray/stations.txt` | `~/Library/Application Support/MPV Radio Tray/stations.txt` |
+| Packaging | Script and `.desktop` launcher | Locally built `.app` bundle |
+| Startup | Tray application, no automatic playback | Menu-bar-only application, starts stopped |
+
+Linux uses mpv because it is a lightweight streaming backend that integrates
+well with Linux audio systems. macOS uses AVFoundation for native audio routing,
+lifecycle, sleep/wake and AirPlay APIs. The project shares behavior and the
+`Station name|stream URL` format while keeping each implementation appropriate
+to its platform.
+
+## Linux
+
+### Install dependencies
 
 ```bash
 sudo apt install mpv python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 bluez pulseaudio-utils
 ```
 
-## Install locally
+### Install locally
 
 ```bash
 mkdir -p ~/.local/bin ~/.config/mpv-radio-tray ~/.local/share/applications
@@ -19,7 +40,7 @@ cp stations.txt ~/.config/mpv-radio-tray/stations.txt
 cp mpv-radio-tray.desktop ~/.local/share/applications/mpv-radio-tray.desktop
 chmod +x ~/.local/bin/mpv-radio-tray
 ```
-### Create an XFCE launcher
+#### Create an XFCE launcher
 
 On XFCE, you can create the application launcher file manually with:
 
@@ -47,7 +68,7 @@ Make sure `~/.local/bin` is in your `PATH`, then start:
 mpv-radio-tray
 ```
 
-## Stations
+### Stations
 
 Edit:
 
@@ -63,7 +84,7 @@ Station name|https://example.com/stream
 
 For RadioJar streams, keep the clean URL rather than redirected token URLs.
 
-## Output
+### Output
 
 Use the tray menu's `Output` submenu to choose **System default**, **Computer**
 (a non-Bluetooth sink), or a Bluetooth device known to `bluetoothctl`.
@@ -117,7 +138,7 @@ and stops if it is lost. This is periodic detection: an audio server that moves
 an already-playing stream after disconnection could briefly send sound elsewhere
 before the check runs. Startup verification is not a system-wide routing lock.
 
-## Recovery behavior
+### Recovery behavior
 
 The app gives its audio-only mpv process a 16 MiB forward cache and a 1 MiB
 back cache, without changing the user's global mpv configuration.
@@ -130,7 +151,7 @@ and then stalled for 30 seconds, the tray app restarts the same station. A
 
 The tray process is not restarted, so the selected station is preserved.
 
-## Linux validation
+### Linux validation
 
 Run the headless regression suite from the repository root:
 
@@ -161,3 +182,60 @@ Select the speaker once on the first run to establish that preference, then:
    separately to check route-loss handling and any server-driven fallback delay.
 
 Check that other applications and the system default remain unchanged throughout.
+
+## macOS
+
+Requires **macOS 13+** and Apple Command Line Tools with **Swift 5.9+**. Install
+the tools with `xcode-select --install` if needed. No Homebrew mpv or third-party
+packages are required.
+
+From the repository root:
+
+```sh
+./macos/scripts/build-app.sh
+open "macos/dist/MPV Radio Tray.app"
+```
+
+To install locally, quit every running copy first, then copy the bundle:
+
+```sh
+ditto "macos/dist/MPV Radio Tray.app" "/Applications/MPV Radio Tray.app"
+codesign --verify --deep --strict "/Applications/MPV Radio Tray.app"
+open "/Applications/MPV Radio Tray.app"
+```
+
+For an upgrade, remove the previous application bundle before copying so old
+resources are not carried forward. Keep the station configuration in place.
+The build is **ad hoc signed for local use**, not notarized or App Store approved.
+This repository publishes source; it does not provide a notarized binary or a
+Mac App Store package. The build targets the current Mac's architecture.
+
+The app starts stopped and displays a radio icon in the menu bar, with no Dock
+icon. Choose a station to play, switch stations from the menu, and use **Stop**
+to clear playback. Recovery handles stream failures, prolonged buffering and
+stalled playback; sleep/wake reconnects a selected station, and Quit releases
+playback and recovery.
+
+Stations live in `~/Library/Application Support/MPV Radio Tray/stations.txt`.
+Use **Edit Stations…** and **Reload Stations**. The first launch copies an
+existing Linux-format configuration if present; existing files are preserved.
+
+**Output** selects System Default or usable exposed CoreAudio devices, including
+physical Bluetooth/USB/display audio. A missing selected device suspends radio
+until it returns or another output is chosen. The app does not change the global
+system output. Pair Bluetooth devices through macOS.
+
+**AirPlay…** is separate from Output and is enabled while radio plays. It hosts
+Apple's native route picker attached to the same AVPlayer. Receiver names come
+from Apple's picker, not CoreAudio enumeration. Opening the receiver list selects
+System Default for the radio; this preference persists if the picker is cancelled.
+Now Playing/media-command registration handles AirPlay Play commands in the radio
+app. Playback to one receiver without launching Music has been manually verified
+on the development Mac; other receivers and macOS versions remain unverified.
+System Default also followed externally selected AirPlay to a receiver and back
+to speakers in earlier testing. AirPlay availability and activation depend on
+macOS and the receiver, and output/availability indicators do not prove audible
+routing. Codec/container support follows AVFoundation; there is no mpv fallback.
+
+Build, installation, output behavior, logs and the maintained automated/manual
+checks are documented in [the macOS guide](macos/README.md).
