@@ -1,2 +1,6 @@
 __pycache__/
 *.py[cod]
+macos/.build/
+macos/.swiftpm/
+macos/dist/
+.DS_Store
