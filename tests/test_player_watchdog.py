@@ -1,5 +1,3 @@
-import importlib.machinery
-import importlib.util
 import os
 import pathlib
 import select
@@ -11,14 +9,9 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = pathlib.Path(__file__).parents[1] / "mpv-radio-tray"
-LOADER = importlib.machinery.SourceFileLoader(
-    "mpv_radio_tray_watchdog",
-    str(SCRIPT),
-)
-SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
-APP = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(APP)
+from app_loader import SCRIPT, load_app
+
+APP = load_app("mpv_radio_tray_watchdog")
 
 
 class FakePlayer:
@@ -161,6 +154,7 @@ class ShutdownTest(unittest.TestCase):
 
         with (
             mock.patch.object(APP, "start_indicator", return_value=tray),
+            mock.patch.object(APP, "load_output_preference"),
             mock.patch.object(APP.GLib, "unix_signal_add") as unix_signal_add,
             mock.patch.object(APP.GLib, "timeout_add_seconds"),
             mock.patch.object(APP.Gtk, "main"),
@@ -223,6 +217,7 @@ class WatchdogTest(unittest.TestCase):
             self.player,
             self.socket_path,
             True,
+            None,
         )
         self.assertTrue(APP.watchdog_check_in_progress)
 

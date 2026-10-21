@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import pathlib
+import re
 import signal
 import socket
 import subprocess
@@ -60,6 +61,7 @@ from gi.repository import GLib, Gtk
 
 CONFIG_DIR = pathlib.Path.home() / ".config" / "mpv-radio-tray"
 STATIONS_FILE = CONFIG_DIR / "stations.txt"
+OUTPUT_FILE = CONFIG_DIR / "output.json"
 
 CHECK_INTERVAL_SECONDS = 5
 STARTUP_GRACE_SECONDS = 12
@@ -68,10 +70,20 @@ IPC_MISSING_RESTART_SECONDS = 25
 STALLED_PLAYBACK_RESTART_SECONDS = 30
 RESTART_COOLDOWN_SECONDS = 30
 BLUETOOTH_CONNECT_TIMEOUT_SECONDS = 12
+BLUETOOTH_SINK_TIMEOUT_SECONDS = 12
+OUTPUT_START_TIMEOUT_SECONDS = 20
 
 player = None
 current_station = None
 selected_audio_device = None
+# Requested preference is durable; the resolved mpv device is session-local.
+requested_output = None  # None = system default, "computer", or Bluetooth address
+output_preference_error = False
+output_generation = 0
+output_cancel = threading.Event()
+output_phase = "idle"
+output_status = "System default"
+output_status_item = None
 started_at = 0.0
 last_restart_at = None
 last_ipc_ok_at = 0.0
@@ -82,6 +94,7 @@ buffering_since = None
 ipc_path = None
 watchdog_check_in_progress = False
 station_menu_items = []
+updating_station_menu = False
 output_menu_items = []
 updating_output_menu = False
 
@@ -119,11 +132,17 @@ def remove_ipc_socket():
 
 
 def new_ipc_path():
-    return str(runtime_dir() / f"mpv-radio-tray-{os.getpid()}.sock")
+    return str(runtime_dir() / f"mpv-radio-tray-{os.getpid()}-{output_generation}.sock")
 
 
 def stop_player():
     global player
+    global output_generation, output_phase, selected_audio_device
+
+    output_cancel.set()
+    output_generation += 1
+    output_phase = "idle"
+    selected_audio_device = None
 
     if player and player.poll() is None:
         try:
@@ -148,10 +167,20 @@ def stop_current_station():
 
     current_station = None
     stop_player()
+    set_output_status("Stopped")
     update_station_menu_state()
 
 
 def start_player(name, url):
+    if output_preference_error:
+        set_output_status("Saved output invalid — choose an Output", "unavailable")
+    elif requested_output is not None:
+        prepare_output((name, url))
+    else:
+        launch_player(name, url)
+
+
+def launch_player(name, url, muted=False):
     global buffering_since
     global ipc_path
     global last_ipc_ok_at
@@ -185,6 +214,8 @@ def start_player(name, url):
     ]
     if selected_audio_device:
         command.append(f"--audio-device={selected_audio_device}")
+    if muted:
+        command.extend(["--mute=yes", "--audio-fallback-to-null=no"])
     command.append(url)
 
     child_command = [
@@ -218,14 +249,28 @@ def update_station_menu_state():
     for item, name, url in station_menu_items:
         is_current = current_station == (name, url)
         if item.get_active() != is_current:
-            item.set_active(is_current)
+            set_station_item_active(item, is_current)
+
+
+def set_station_item_active(item, active):
+    global updating_station_menu
+
+    updating_station_menu = True
+    try:
+        item.set_active(active)
+    finally:
+        updating_station_menu = False
 
 
 def activate_station_menu_item(item, name, url):
+    if updating_station_menu:
+        return
     if item.get_active():
         play_station(name, url)
     elif current_station == (name, url):
-        item.set_active(True)
+        set_station_item_active(item, True)
+        if output_phase == "unavailable":
+            play_station(name, url)
 
 
 def restart_current_station(reason):
@@ -259,7 +304,12 @@ def mpv_command(command, socket_path=None):
             sock.sendall(payload + b"\n")
 
             buffer = b""
+            deadline = time.monotonic() + 1.0
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                sock.settimeout(remaining)
                 chunk = sock.recv(4096)
                 if not chunk:
                     return None
@@ -291,6 +341,7 @@ def run_command(command, timeout=3):
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except Exception:
         return None
@@ -301,23 +352,21 @@ def run_command(command, timeout=3):
     return completed.stdout
 
 
-def pactl_sinks():
-    output = run_command(["pactl", "-f", "json", "list", "sinks"])
+def pactl_sinks(timeout=3):
+    deadline = time.monotonic() + timeout
+    output = run_command(["pactl", "-f", "json", "list", "sinks"], timeout=timeout)
     if output:
         try:
             sinks = json.loads(output)
-            return [
-                {
-                    "name": sink.get("name", ""),
-                    "description": sink.get("description", sink.get("name", "")),
-                }
-                for sink in sinks
-                if sink.get("name")
-            ]
-        except json.JSONDecodeError:
+            if isinstance(sinks, list):
+                return [sink for sink in sinks if isinstance(sink, dict) and sink.get("name")]
+        except (ValueError, TypeError):
             pass
 
-    output = run_command(["pactl", "list", "short", "sinks"])
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return []
+    output = run_command(["pactl", "list", "short", "sinks"], timeout=remaining)
     if not output:
         return []
 
@@ -325,7 +374,7 @@ def pactl_sinks():
     for line in output.splitlines():
         parts = line.split("\t")
         if len(parts) >= 2:
-            sinks.append({"name": parts[1], "description": parts[1]})
+            sinks.append({"index": parts[0], "name": parts[1], "description": parts[1]})
     return sinks
 
 
@@ -366,97 +415,267 @@ def bluetooth_devices():
     return devices
 
 
-def bluetooth_sink_name(address):
+def bluetooth_address(value):
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}", value):
+        return value.upper()
+    return None
+
+
+def load_output_preference():
+    global requested_output, output_preference_error
+
+    requested_output = None
+    output_preference_error = False
+    try:
+        value = json.loads(OUTPUT_FILE.read_text())["output"]
+        if value not in (None, "computer") and not bluetooth_address(value):
+            raise ValueError("invalid output")
+        requested_output = bluetooth_address(value) or value
+        set_output_status("Bluetooth selected — start a station" if bluetooth_address(value)
+                          else "Computer selected" if value == "computer" else "System default")
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, KeyError, TypeError):
+        # A damaged saved Bluetooth preference must not silently become local audio.
+        output_preference_error = True
+        set_output_status("Saved output invalid — choose an Output", "unavailable")
+
+
+def save_output_preference():
+    temporary = None
+    try:
+        OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=OUTPUT_FILE.parent, delete=False) as handle:
+            temporary = pathlib.Path(handle.name)
+            json.dump({"output": requested_output}, handle)
+            handle.write("\n")
+        temporary.replace(OUTPUT_FILE)
+    except OSError as error:
+        print(f"Could not save output preference: {error}", file=sys.stderr)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def bluetooth_sink_name(address, timeout=3):
     address_part = address.replace(":", "_").upper()
-    matches = [
-        sink["name"]
-        for sink in pactl_sinks()
-        if sink["name"].startswith(f"bluez_output.{address_part}.")
-    ]
+    matches = []
+    for sink in pactl_sinks(timeout=timeout):
+        name = sink["name"]
+        properties = sink.get("properties") or {}
+        named = any(name.upper().startswith(f"{prefix}.{address_part}.")
+                    for prefix in ("BLUEZ_OUTPUT", "BLUEZ_SINK"))
+        identified = any(bluetooth_address(properties.get(key)) == address
+                         for key in ("api.bluez5.address", "device.string"))
+        if named or identified:
+            matches.append(sink)
     if not matches:
         return None
+    for sink in matches:
+        profile = str((sink.get("properties") or {}).get("api.bluez5.profile", ""))
+        if "a2dp" in (sink["name"] + profile).lower():
+            return sink["name"]
+    return matches[0]["name"]
 
-    for name in matches:
-        if "a2dp" in name.lower():
-            return name
 
-    return matches[0]
+def bluetooth_connected(address, timeout=3):
+    info = run_command(["bluetoothctl", "info", address], timeout=timeout) or ""
+    return any(line.strip() == "Connected: yes" for line in info.splitlines())
 
 
-def selected_sink_name():
-    pulse_prefix = "pulse/"
-    if selected_audio_device and selected_audio_device.startswith(pulse_prefix):
-        return selected_audio_device[len(pulse_prefix) :]
-    return default_sink_name()
+def resolve_bluetooth_output(address, cancelled):
+    if cancelled.is_set():
+        return None
+    if not bluetooth_connected(address) and not cancelled.is_set():
+        run_command(["bluetoothctl", "connect", address],
+                    timeout=BLUETOOTH_CONNECT_TIMEOUT_SECONDS)
+    # Connect returning (even with an error) is not proof the audio sink exists.
+    deadline = time.monotonic() + BLUETOOTH_SINK_TIMEOUT_SECONDS
+    while not cancelled.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sink_name = bluetooth_sink_name(address, timeout=min(3, remaining))
+        remaining = deadline - time.monotonic()
+        if (sink_name and remaining > 0 and not cancelled.is_set()
+                and bluetooth_connected(address, timeout=min(3, remaining))):
+            return sink_name
+        cancelled.wait(min(0.5, max(0, deadline - time.monotonic())))
+    return None
+
+
+def pactl_sink_inputs(timeout=3):
+    deadline = time.monotonic() + timeout
+    output = run_command(["pactl", "-f", "json", "list", "sink-inputs"], timeout=timeout)
+    try:
+        inputs = json.loads(output)
+        if isinstance(inputs, list):
+            return [entry for entry in inputs if isinstance(entry, dict)]
+    except (ValueError, TypeError):
+        pass
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return []
+    # Older PulseAudio pactl lacks JSON. LC_ALL=C keeps these field labels stable.
+    output = run_command(["pactl", "list", "sink-inputs"], timeout=remaining) or ""
+    inputs = []
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("Sink Input #"):
+            inputs.append({"properties": {}})
+        elif inputs and line.startswith("Sink:"):
+            inputs[-1]["sink"] = line.split(":", 1)[1].strip()
+        elif inputs and line.startswith("application.process.id ="):
+            inputs[-1]["properties"]["application.process.id"] = line.split("=", 1)[1].strip().strip('"')
+    return inputs
+
+
+def mpv_stream_uses_sink(pid, sink_name, timeout=3):
+    deadline = time.monotonic() + timeout
+    sinks = pactl_sinks(timeout=timeout)
+    index = next((sink.get("index") for sink in sinks if sink["name"] == sink_name), None)
+    remaining = deadline - time.monotonic()
+    if index is None or remaining <= 0:
+        return False
+    inputs = [entry for entry in pactl_sink_inputs(timeout=remaining)
+              if str((entry.get("properties") or {}).get("application.process.id")) == str(pid)]
+    return bool(inputs) and all(str(entry.get("sink")) == str(index) for entry in inputs)
+
+
+def set_output_status(message, phase=None):
+    global output_status, output_phase
+
+    output_status = message
+    if phase is not None:
+        output_phase = phase
+    if output_status_item is not None:
+        output_status_item.set_label(message)
 
 
 def update_output_menu_state():
     global updating_output_menu
 
-    sink_name = selected_sink_name()
     updating_output_menu = True
-
     try:
-        for item, address in output_menu_items:
-            if not sink_name:
-                is_selected = False
-            elif address is None:
-                is_selected = not is_bluetooth_sink(sink_name)
-            else:
-                address_part = address.replace(":", "_").upper()
-                is_selected = sink_name.startswith(f"bluez_output.{address_part}.")
-
+        for item, target in output_menu_items:
+            is_selected = not output_preference_error and requested_output == target
             if item.get_active() != is_selected:
                 item.set_active(is_selected)
     finally:
         updating_output_menu = False
-
     return False
 
 
-def set_output_sink(sink_name):
-    global selected_audio_device
+def choose_output(target):
+    global requested_output, output_preference_error, last_restart_at
 
-    selected_audio_device = f"pulse/{sink_name}"
-
-    if current_station:
-        mpv_command(["set_property", "audio-device", selected_audio_device])
-
-    GLib.idle_add(update_output_menu_state)
+    if updating_output_menu:
+        return
+    requested_output = target
+    output_preference_error = False
+    save_output_preference()
+    stop_player()
+    last_restart_at = None
+    update_output_menu_state()
+    if target is None:
+        set_output_status("System default")
+        if current_station:
+            start_player(*current_station)
+    else:
+        prepare_output(current_station)
 
 
 def select_computer_output():
-    sink_name = computer_sink_name()
-    if sink_name:
-        set_output_sink(sink_name)
+    choose_output("computer")
 
 
 def select_bluetooth_output(address):
-    run_command(
-        ["bluetoothctl", "connect", address],
-        timeout=BLUETOOTH_CONNECT_TIMEOUT_SECONDS,
-    )
+    address = bluetooth_address(address)
+    if address:
+        choose_output(address)
 
-    deadline = time.monotonic() + BLUETOOTH_CONNECT_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        sink_name = bluetooth_sink_name(address)
-        if sink_name:
-            set_output_sink(sink_name)
-            return
-        time.sleep(0.5)
+
+def prepare_output(station):
+    global output_cancel, selected_audio_device
+
+    selected_audio_device = None
+    output_cancel = threading.Event()
+    set_output_status("Preparing selected output…", "preparing")
+    run_in_background(resolve_output, output_generation, requested_output, station, output_cancel)
+
+
+def resolve_output(generation, target, station, cancelled):
+    try:
+        sink = computer_sink_name() if target == "computer" else resolve_bluetooth_output(target, cancelled)
+    except Exception:
+        sink = None
+    if not cancelled.is_set():
+        GLib.idle_add(apply_resolved_output, generation, target, station, sink)
+
+
+def apply_resolved_output(generation, target, station, sink):
+    global selected_audio_device
+
+    if generation != output_generation or target != requested_output:
+        return False
+    if not sink:
+        set_output_status("Output unavailable — select station or output to retry", "unavailable")
+        return False
+    selected_audio_device = f"pulse/{sink}"
+    if station is None:
+        set_output_status("Output ready", "ready")
+        return False
+    try:
+        # Gate Bluetooth audio until the server confirms this mpv process's route.
+        launch_player(*station, muted=target != "computer")
+    except OSError:
+        selected_audio_device = None
+        set_output_status("Could not start mpv — select station to retry", "unavailable")
+        return False
+    if target == "computer":
+        set_output_status("Computer output", "ready")
+    else:
+        set_output_status("Checking Bluetooth audio…", "verifying")
+        run_in_background(verify_bluetooth_playback, generation, player, ipc_path, sink, output_cancel)
+    return False
+
+
+def verify_bluetooth_playback(generation, process, socket_path, sink, cancelled):
+    success = False
+    deadline = time.monotonic() + OUTPUT_START_TIMEOUT_SECONDS
+    try:
+        while not cancelled.is_set() and process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if mpv_stream_uses_sink(process.pid, sink, timeout=min(3, remaining)):
+                if cancelled.is_set():
+                    return
+                response = mpv_command(["set_property", "mute", False], socket_path)
+                if response and response.get("error") == "success":
+                    success = True
+                    break
+            cancelled.wait(min(0.2, max(0, deadline - time.monotonic())))
+    except Exception:
+        pass
+    if not cancelled.is_set():
+        GLib.idle_add(finish_bluetooth_playback, generation, process, success)
+
+
+def finish_bluetooth_playback(generation, process, success):
+    if generation != output_generation or player is not process:
+        return False
+    if success and process.poll() is None:
+        set_output_status("Bluetooth audio routed", "ready")
+    else:
+        stop_player()
+        set_output_status("Bluetooth audio unavailable — select station to retry", "unavailable")
+    return False
 
 
 def run_in_background(function, *args):
     thread = threading.Thread(target=function, args=args, daemon=True)
     thread.start()
-
-
-def select_output_in_background(function, *args):
-    if updating_output_menu:
-        return
-
-    GLib.idle_add(update_output_menu_state)
-    run_in_background(function, *args)
 
 
 def read_watchdog_status(socket_path, include_playback_status):
@@ -481,11 +700,16 @@ def read_watchdog_status(socket_path, include_playback_status):
     return status
 
 
-def check_watchdog_status(monitored_player, monitored_ipc_path, include_playback_status):
+def check_watchdog_status(monitored_player, monitored_ipc_path, include_playback_status,
+                          bluetooth_sink=None):
     global watchdog_check_in_progress
 
     try:
         status = read_watchdog_status(monitored_ipc_path, include_playback_status)
+        if bluetooth_sink and status["ipc_ok"] and not status["eof_reached"]:
+            status["output_available"] = mpv_stream_uses_sink(monitored_player.pid, bluetooth_sink)
+            if not status["output_available"]:
+                mpv_command(["set_property", "mute", True], monitored_ipc_path)
     except Exception:
         status = None
     try:
@@ -521,6 +745,11 @@ def apply_watchdog_status(monitored_player, monitored_ipc_path, status):
 
     if player.poll() is not None:
         restart_current_station("mpv exited")
+        return False
+
+    if status.get("output_available") is False:
+        stop_player()
+        set_output_status("Bluetooth output lost — select station to retry", "unavailable")
         return False
 
     now = time.monotonic()
@@ -573,6 +802,9 @@ def watchdog_tick():
     if not current_station:
         return True
 
+    if output_phase in ("preparing", "verifying", "unavailable"):
+        return True
+
     if not player or player.poll() is not None:
         restart_current_station("mpv exited")
         return True
@@ -586,6 +818,8 @@ def watchdog_tick():
         player,
         ipc_path,
         time.monotonic() - started_at > STARTUP_GRACE_SECONDS,
+        selected_audio_device[len("pulse/"):]
+        if bluetooth_address(requested_output) and selected_audio_device else None,
     )
 
     return True
@@ -599,6 +833,7 @@ def quit_app(*args):
 
 def build_menu():
     global output_menu_items
+    global output_status_item
     global station_menu_items
 
     menu = Gtk.Menu()
@@ -634,32 +869,52 @@ def build_menu():
     output_item = Gtk.MenuItem(label="Output")
     output_menu = Gtk.Menu()
 
+    output_status_item = Gtk.MenuItem(label=output_status)
+    output_status_item.set_sensitive(False)
+    output_menu.append(output_status_item)
+    default_item = Gtk.CheckMenuItem(label="System default")
+    default_item.set_draw_as_radio(True)
+    default_item.connect("activate", lambda _item: choose_output(None))
+    output_menu_items.append((default_item, None))
+    output_menu.append(default_item)
+
     computer_item = Gtk.CheckMenuItem(label="Computer")
     computer_item.set_draw_as_radio(True)
     computer_item.connect(
         "activate",
-        lambda _item: select_output_in_background(select_computer_output),
+        lambda _item: select_computer_output(),
     )
-    output_menu_items.append((computer_item, None))
+    output_menu_items.append((computer_item, "computer"))
     output_menu.append(computer_item)
 
     output_menu.append(Gtk.SeparatorMenuItem())
 
-    devices = bluetooth_devices()
-    if not devices:
-        no_devices_item = Gtk.MenuItem(label="No Bluetooth devices listed")
-        no_devices_item.set_sensitive(False)
-        output_menu.append(no_devices_item)
-    else:
+    def add_devices(devices):
+        # Ignore a response for a menu replaced by the StatusIcon fallback.
+        if not any(item is computer_item for item, _target in output_menu_items):
+            return False
+        devices = [(bluetooth_address(address), name) for address, name in devices
+                   if bluetooth_address(address)]
+        if bluetooth_address(requested_output) and requested_output not in [a for a, _ in devices]:
+            devices.append((requested_output, f"Saved Bluetooth ({requested_output})"))
         for address, name in devices:
             device_item = Gtk.CheckMenuItem(label=name)
             device_item.set_draw_as_radio(True)
-            device_item.connect(
-                "activate",
-                lambda _item, a=address: select_output_in_background(select_bluetooth_output, a),
-            )
+            device_item.connect("activate", lambda _item, a=address: select_bluetooth_output(a))
             output_menu_items.append((device_item, address))
             output_menu.append(device_item)
+        if not devices:
+            item = Gtk.MenuItem(label="No Bluetooth devices listed")
+            item.set_sensitive(False)
+            output_menu.append(item)
+        update_output_menu_state()
+        output_menu.show_all()
+        return False
+
+    def discover_devices():
+        GLib.idle_add(add_devices, bluetooth_devices())
+
+    run_in_background(discover_devices)
 
     output_menu.connect("show", lambda _menu: update_output_menu_state())
     update_output_menu_state()
@@ -719,6 +974,7 @@ def start_indicator():
 
 
 def main():
+    load_output_preference()
     for signal_number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal_number, quit_app)
 
