@@ -1,193 +1,169 @@
-# MPV Radio Tray
+# mpv Radio Tray
 
 A lightweight tray/menu-bar internet radio player for Linux and macOS.
 
-## Platforms
+The two implementations share a purpose and a station-list format, with native
+interfaces and different playback backends. The historical project name remains
+`mpv-radio-tray`: **Linux uses mpv; macOS uses AVFoundation and does not require mpv.**
 
 | Feature | Linux | macOS |
 | --- | --- | --- |
 | UI | GTK tray | Native AppKit menu bar |
-| Language | Python | Swift |
-| Playback | External mpv process | AVFoundation / AVPlayer |
-| mpv dependency | Yes | No |
-| Radio recovery | mpv IPC watchdog | AVFoundation observations and watchdog |
-| Bluetooth | BlueZ and the Linux audio stack | macOS system audio and pairing |
-| AirPlay | No dedicated integration | Native Apple route picker; receiver support varies |
-| Station config | `~/.config/mpv-radio-tray/stations.txt` | `~/Library/Application Support/MPV Radio Tray/stations.txt` |
-| Packaging | Script and `.desktop` launcher | Locally built `.app` bundle |
-| Startup | Tray application, no automatic playback | Menu-bar-only application, starts stopped |
+| Main language | Python | Swift |
+| Playback backend | External mpv process | AVFoundation / AVPlayer |
+| mpv required | Yes | No |
+| Recovery | mpv IPC/watchdog | AVFoundation observations/watchdog |
+| Bluetooth/output routing | BlueZ + PulseAudio, or PipeWire through `pipewire-pulse` | CoreAudio output discovery + AVPlayer routing; pairing managed by macOS |
+| Remembered output | Requested Bluetooth address or local/default choice saved; current sink resolved before playback | Physical output UID/name persisted; missing selected output suspends playback |
+| AirPlay | No dedicated AirPlay integration | Native Apple picker attached to the radio AVPlayer; discovery/receiver limitations apply |
+| Station file | `~/.config/mpv-radio-tray/stations.txt` | `~/Library/Application Support/MPV Radio Tray/stations.txt` |
+| App format | Python tray script + `.desktop` launcher | Locally built `.app` bundle |
+| Startup | Starts stopped | Starts stopped; menu bar only, no Dock icon |
 
-Linux uses mpv because it is a lightweight streaming backend that integrates
-well with Linux audio systems. macOS uses AVFoundation for native audio routing,
-lifecycle, sleep/wake and AirPlay APIs. The project shares behavior and the
-`Station name|stream URL` format while keeping each implementation appropriate
-to its platform.
+## Stations
+
+Both platforms use plain-text station files with one entry per line:
+
+```text
+# Station name|stream URL
+Galaxy 92.92|https://netradio.live24.gr/galaxy9292
+RED FM 96.3|https://stream.radiojar.com/redfm963
+```
+
+The format is `Station name|https://stream-url`. Blank lines and lines beginning
+with `#` are ignored; order is preserved. Use direct HTTP/HTTPS audio streams.
+For RadioJar, keep the clean station URL instead of a redirected token URL.
+
+Edit the platform-specific file shown in the table. Linux reads it when building
+the tray menu; relaunch to ensure an edited list is loaded. macOS provides
+**Edit Stations…** and **Reload Stations**. Its first launch copies the Linux
+station file if present, otherwise bundled defaults, without overwriting an
+existing macOS file or changing Linux configuration.
+
+The parsers share the format, with different validation: Linux skips lines
+without a separator; macOS requires a name and an HTTP/HTTPS URL with a host.
+An invalid macOS edit shows a line-number error and retains the previous valid
+menu. Reloading does not change a stream already playing; reselect it to use an
+edited URL. A valid URL does not guarantee that the stream is playable.
 
 ## Linux
 
-### Install dependencies
+### Dependencies
 
-```bash
+On Debian/Ubuntu-based systems:
+
+```sh
 sudo apt install mpv python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 bluez pulseaudio-utils
 ```
 
+Use the distribution's Python 3 and GTK bindings. `bluetoothctl` comes from BlueZ;
+`pactl` comes from the PulseAudio utilities. PipeWire systems need the
+`pipewire-pulse` compatibility service and an mpv build with PulseAudio support.
+The app supports PulseAudio and PipeWire Bluetooth sink naming; older `pactl`
+versions without JSON use a fixed-locale text fallback. It does not use a native
+PipeWire control interface.
+
 ### Install locally
 
-```bash
-mkdir -p ~/.local/bin ~/.config/mpv-radio-tray ~/.local/share/applications
-cp mpv-radio-tray ~/.local/bin/mpv-radio-tray
-cp stations.txt ~/.config/mpv-radio-tray/stations.txt
-cp mpv-radio-tray.desktop ~/.local/share/applications/mpv-radio-tray.desktop
-chmod +x ~/.local/bin/mpv-radio-tray
+From a checkout of this repository, quit the running radio before replacing its
+script. These commands preserve an existing station file:
+
+```sh
+mkdir -p "$HOME/.local/bin" "$HOME/.config/mpv-radio-tray"
+install -m 755 mpv-radio-tray "$HOME/.local/bin/mpv-radio-tray"
+if [ ! -e "$HOME/.config/mpv-radio-tray/stations.txt" ]; then
+    install -m 644 stations.txt "$HOME/.config/mpv-radio-tray/stations.txt"
+fi
+"$HOME/.local/bin/mpv-radio-tray"
 ```
-#### Create an XFCE launcher
 
-On XFCE, you can create the application launcher file manually with:
+Alternatively run `./mpv-radio-tray` directly from the checkout for testing. This
+uses your normal stations/config; there is no separate test-config environment
+variable. Keep only one copy running. The Linux app starts stopped and offers
+station selection, **Output**, **Stop** and **Quit**.
 
-```bash
-mkdir -p ~/.local/share/applications
+### Optional XFCE/application launcher
 
-cat > ~/.local/share/applications/mpv-radio-tray.desktop <<EOF
+Create a launcher with the installed script's absolute path:
+
+```sh
+mkdir -p "$HOME/.local/share/applications"
+cat > "$HOME/.local/share/applications/mpv-radio-tray.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=mpv Radio Tray
 Comment=Small radio tray player using mpv
-Exec=$HOME/.local/bin/mpv-radio-tray
+Exec="$HOME/.local/bin/mpv-radio-tray"
 Icon=multimedia-player
 Terminal=false
 Categories=Audio;Player;
 StartupNotify=false
 EOF
-chmod 644 ~/.local/share/applications/mpv-radio-tray.desktop
-xfce4-panel -r
+chmod 644 "$HOME/.local/share/applications/mpv-radio-tray.desktop"
 ```
 
-Make sure `~/.local/bin` is in your `PATH`, then start:
+This can be used from XFCE's application menu or panel launcher. The repository
+also includes a PATH-based [desktop entry](mpv-radio-tray.desktop); using it
+requires `~/.local/bin` in the desktop session's `PATH`.
 
-```bash
-mpv-radio-tray
-```
+### Output and remembered Bluetooth routing
 
-### Stations
+**Output** offers **System default**, **Computer** (a non-Bluetooth sink), and
+devices listed by `bluetoothctl devices`. Pair/trust the speaker normally first;
+the app does not pair devices or change Bluetooth profiles.
 
-Edit:
+The requested output is saved in `~/.config/mpv-radio-tray/output.json`. The menu
+dot represents that preference; a separate status line reports whether it is
+preparing, routed or unavailable. On the first run after upgrading from a version
+without persistence, select the speaker once to establish the saved preference.
 
-```text
-~/.config/mpv-radio-tray/stations.txt
-```
+For every station start, station switch, output selection and watchdog restart:
 
-Use one station per line:
+1. Check the remembered Bluetooth address and request connection if needed.
+2. Wait for its current audio sink, even if the speaker was already connected.
+3. Resolve the current sink name/index instead of trusting a previous session's ID.
+4. Start mpv explicitly on `pulse/<sink>`, muted; verify that mpv's own stream uses
+   that sink before unmuting and reporting **Bluetooth audio routed**.
 
-```text
-Station name|https://example.com/stream
-```
+Bluetooth connection, device enumeration and sink discovery run in background
+workers. Stop, Quit, station changes and output changes invalidate stale work.
+The connection command has a 12-second timeout, sink discovery another 12 seconds,
+and muted stream verification 20 seconds, plus bounded probes/cleanup.
 
-For RadioJar streams, keep the clean URL rather than redirected token URLs.
+If the speaker or route cannot be verified, playback stays stopped, the preference
+remains selected, and the status offers a retry. There is **no intentional fallback
+to laptop speakers** for an explicit Bluetooth choice. Click the station again,
+reselect the output, or choose another output to retry. Slow streams, missing
+tools or an unusable audio profile can also produce this unavailable state.
 
-### Output
+Only this app's mpv process is routed; the system default and other applications'
+streams are not changed. The watchdog stops playback if its Bluetooth route is
+lost. An audio server can independently move an already-playing stream before
+that periodic check, so brief audio elsewhere after disconnection remains
+possible. Startup verification is not a system-wide routing lock.
 
-Use the tray menu's `Output` submenu to choose **System default**, **Computer**
-(a non-Bluetooth sink), or a Bluetooth device known to `bluetoothctl`.
-The dot represents the **requested preference**, not proof of a live connection.
-The status line separately reports preparation, routing, or an unavailable output.
+Linux has no dedicated AirPlay discovery, picker or receiver support in this app.
 
-The preference is saved in `~/.config/mpv-radio-tray/output.json`. Only the
-Bluetooth address or local/default choice is saved; sink names and numeric IDs
-are resolved afresh. Earlier versions did not persist an output preference and
-could infer the dot from the system default. Select your speaker once after
-upgrading to establish the saved preference.
+### Recovery and shutdown
 
-Bluetooth devices must already be paired or otherwise listed by:
+mpv uses a 16 MiB forward cache, 1 MiB back cache and 10-second readahead preference
+without changing the user's global mpv configuration. A five-second background
+IPC watchdog detects process exit, stream end, missing IPC, continuous buffering
+for 25 seconds, or playback that progressed and then stalled for 30 seconds.
+Startup grace and a 30-second restart cooldown prevent premature/rapid retries.
+Every Bluetooth restart repeats connection and current-sink resolution.
 
-```bash
-bluetoothctl devices
-```
-
-On station start, station switch, manual output selection, and watchdog restart,
-the app checks the requested Bluetooth device, connects if necessary, and waits
-for its current sink. An already-connected device is still resolved again.
-Bluetooth connection, enumeration, and sink discovery run outside the GTK loop.
-The device must already be paired, and some desktops may require it to be trusted.
-
-mpv starts with the explicit `pulse/<sink>` device and initially muted. The app
-checks that mpv's own PulseAudio sink-input is on the resolved sink before
-unmuting and reporting **Bluetooth audio routed**. Connection/sink/startup
-failure leaves playback stopped, retains the requested preference, and shows a
-retry message. There is no intentional fallback to laptop speakers. Click the
-station again (even if checked), reselect the output, or choose another output
-to retry. Stop and Quit cancel pending work. Changing output restarts the current
-station through the same preparation path.
-
-A connection command is limited to 12 seconds, sink discovery to another
-12 seconds, and muted mpv route verification to 20 seconds; individual probes
-and shutdown also have bounded timeouts. There is no endless automatic retry
-loop for an unavailable output. Missing tools, an unusable audio profile, an
-unverifiable stream, or a slow/failing radio stream can produce an unavailable
-message. The app does not pair devices or change Bluetooth profiles.
-
-Routing uses `pactl` and mpv's PulseAudio output on both PulseAudio and PipeWire
-with `pipewire-pulse`. Sink matching supports `bluez_sink` and `bluez_output`
-names plus Bluetooth address properties, and prefers an available A2DP sink.
-Older `pactl` versions without JSON use text output with a fixed locale. Native
-PipeWire-only installations need the PulseAudio compatibility service and an mpv
-build with PulseAudio support.
-
-The tray app routes only `mpv`; it does not change the system-wide default or
-other applications' audio. During playback the watchdog checks the actual route
-and stops if it is lost. This is periodic detection: an audio server that moves
-an already-playing stream after disconnection could briefly send sound elsewhere
-before the check runs. Startup verification is not a system-wide routing lock.
-
-### Recovery behavior
-
-The app gives its audio-only mpv process a 16 MiB forward cache and a 1 MiB
-back cache, without changing the user's global mpv configuration.
-
-It checks mpv's private IPC socket every five seconds without blocking the tray
-UI. If mpv reports `paused-for-cache` continuously for 25 seconds, exits,
-reaches EOF, stops responding through IPC, or reports playback time that moved
-and then stalled for 30 seconds, the tray app restarts the same station. A
-30-second restart cooldown prevents rapid restart loops.
-
-The tray process is not restarted, so the selected station is preserved.
-
-### Linux validation
-
-Run the headless regression suite from the repository root:
-
-```sh
-python3 -m unittest discover -s tests -v
-```
-
-The tests simulate GTK dispatch, Bluetooth, PulseAudio/PipeWire responses and
-mpv; Linux parent-death tests run only on Linux. They do not prove hardware audio.
-On the Linux laptop, quit the installed app and run this branch directly from a
-separate checkout (`./mpv-radio-tray`) before replacing the installed executable.
-It uses your normal stations/config and writes the new `output.json` preference.
-Select the speaker once on the first run to establish that preference, then:
-
-1. Pair/trust the speaker normally, select it in Output, start a station, and
-   confirm sound on the speaker and **Bluetooth audio routed** in Output.
-2. Quit and relaunch with the speaker connected. Do not touch Output. Start a
-   station; confirm it plays on the remembered speaker without laptop audio.
-3. Repeat with the paired speaker initially disconnected but powered on. Confirm
-   reconnection and silence while preparing/verifying, followed by speaker audio.
-4. Repeat with the speaker powered off. Confirm a bounded unavailable message,
-   the requested checkmark remains, and Output/Stop/Quit remain usable.
-5. Power it back on and click the checked station to retry. Also test manual
-   re-selection, station switching, Computer/System default, and quitting during
-   connection. Confirm no late worker starts playback after Stop or Quit.
-6. Interrupt the stream or terminate the owned mpv process during playback;
-   confirm watchdog restart uses the speaker again. Power off a playing speaker
-   separately to check route-loss handling and any server-driven fallback delay.
-
-Check that other applications and the system default remain unchanged throughout.
+**Stop** cancels playback/preparation. **Quit**, logout signals and normal GTK
+shutdown terminate/reap the mpv process group. A Linux parent-death signal also
+terminates the owned playback process if the tray process dies unexpectedly.
 
 ## macOS
 
+### Build and install locally
+
 Requires **macOS 13+** and Apple Command Line Tools with **Swift 5.9+**. Install
-the tools with `xcode-select --install` if needed. No Homebrew mpv or third-party
-packages are required.
+the tools with `xcode-select --install` if needed. There are no third-party package
+or Homebrew mpv requirements.
 
 From the repository root:
 
@@ -196,7 +172,15 @@ From the repository root:
 open "macos/dist/MPV Radio Tray.app"
 ```
 
-To install locally, quit every running copy first, then copy the bundle:
+The build targets the current Mac's architecture, treats Swift warnings as errors,
+and packages the app icon, adaptive monochrome menu-bar icon and default stations.
+It uses **ad hoc signing for local use**, without Developer ID signing or
+notarization. No notarized binary or Mac App Store package is provided; deployment
+target compatibility does not establish testing on every macOS release or Mac.
+
+To install, quit every running copy. For an upgrade, move the previous application
+bundle out of Applications first so obsolete resources are not carried forward;
+station configuration lives outside the bundle and should be retained. Then:
 
 ```sh
 ditto "macos/dist/MPV Radio Tray.app" "/Applications/MPV Radio Tray.app"
@@ -204,38 +188,127 @@ codesign --verify --deep --strict "/Applications/MPV Radio Tray.app"
 open "/Applications/MPV Radio Tray.app"
 ```
 
-For an upgrade, remove the previous application bundle before copying so old
-resources are not carried forward. Keep the station configuration in place.
-The build is **ad hoc signed for local use**, not notarized or App Store approved.
-This repository publishes source; it does not provide a notarized binary or a
-Mac App Store package. The build targets the current Mac's architecture.
+The native AppKit app starts stopped on every launch, including login startup,
+with no Dock icon. It owns one persistent AVPlayer; station switches replace its
+item. **Stop** clears the station, while media Pause retains it and releases the
+live connection. **Resume** reconnects at the live edge. Quit releases media,
+observers, timers and media-command handlers.
 
-The app starts stopped and displays a radio icon in the menu bar, with no Dock
-icon. Choose a station to play, switch stations from the menu, and use **Stop**
-to clear playback. Recovery handles stream failures, prolonged buffering and
-stalled playback; sleep/wake reconnects a selected station, and Quit releases
-playback and recovery.
+### Outputs and AirPlay
 
-Stations live in `~/Library/Application Support/MPV Radio Tray/stations.txt`.
-Use **Edit Stations…** and **Reload Stations**. The first launch copies an
-existing Linux-format configuration if present; existing files are preserved.
+**Output** selects **System Default** or usable exposed CoreAudio outputs such as
+built-in, USB, Bluetooth, display and aggregate devices. Selection sets the radio
+player's output UID; it does not set the global system output. Pair Bluetooth
+through macOS. Input-only, unavailable, UID-less, duplicate, virtual software and
+AirPlay-transport entries are excluded from this direct output list.
 
-**Output** selects System Default or usable exposed CoreAudio devices, including
-physical Bluetooth/USB/display audio. A missing selected device suspends radio
-until it returns or another output is chosen. The app does not change the global
-system output. Pair Bluetooth devices through macOS.
+The requested physical output UID/name persist across application launches,
+station changes, recovery and sleep/wake. If it disappears, radio suspends until
+it returns or another output is chosen. Pause, Stop and sleep prevent unwanted
+resumption. **Refresh Outputs** refreshes the exposed CoreAudio inventory.
 
-**AirPlay…** is separate from Output and is enabled while radio plays. It hosts
-Apple's native route picker attached to the same AVPlayer. Receiver names come
-from Apple's picker, not CoreAudio enumeration. Opening the receiver list selects
-System Default for the radio; this preference persists if the picker is cancelled.
-Now Playing/media-command registration handles AirPlay Play commands in the radio
-app. Playback to one receiver without launching Music has been manually verified
-on the development Mac; other receivers and macOS versions remain unverified.
-System Default also followed externally selected AirPlay to a receiver and back
-to speakers in earlier testing. AirPlay availability and activation depend on
-macOS and the receiver, and output/availability indicators do not prove audible
-routing. Codec/container support follows AVFoundation; there is no mpv fallback.
+**AirPlay…** is enabled while radio plays. It opens a compact native popover;
+click the Apple route-picker button inside to choose a receiver. AVRoutePickerView
+uses the same AVPlayer as radio. Opening Apple's receiver list selects **System
+Default** for the radio so a fixed physical UID cannot pin it elsewhere; this
+preference persists even if selection is cancelled. Opening only the host popover
+does not change Output. The host closes after the receiver list dismisses.
 
-Build, installation, output behavior, logs and the maintained automated/manual
-checks are documented in [the macOS guide](macos/README.md).
+AVRouteDetector supplies a **routes available** hint, not a receiver list or proof
+of activation. AirPlay receivers are managed by Apple's picker and macOS rather
+than saved as direct CoreAudio output preferences. Refresh Outputs does not
+discover AirPlay receivers or repair system-level discovery.
+
+Playback through the native picker to one receiver, with Music staying closed,
+was manually confirmed on the development Mac after Now Playing/media-command
+integration. Radio also followed a system-selected receiver and returned to
+speakers in earlier testing with Output = System Default; that separate path
+was not rechecked after media-command registration. Discovery has varied during
+testing, including receivers disappearing from macOS's own list. Other receivers,
+macOS versions and continuity across reconnects still need manual validation.
+There is no custom receiver browser or mpv fallback.
+
+### Recovery, streams and logs
+
+AVFoundation item/player observations and a five-second watchdog handle failures,
+stream end, 30 seconds of continuous waiting or stalled progress, a 12-second
+startup grace, and a 30-second retry cooldown. Pause and Stop suppress recovery.
+Sleep releases the item; wake reconnects a selected station unless paused/stopped
+or its requested output is unavailable. The 10-second forward-buffer setting is
+a preference, not a fixed memory cap.
+
+Direct HTTP/HTTPS streams are supported subject to AVFoundation's codec/container
+and server-response support; HLS is not required. Media-only ATS permission allows
+configured HTTP radio, which is unencrypted; prefer HTTPS where available.
+**Show Logs** opens `~/Library/Logs/MPV Radio Tray/`, with rotating playback,
+output and lifecycle diagnostics. See the [macOS guide](macos/README.md) for details.
+
+## Architecture
+
+```text
+Linux: GTK → Python → mpv → PulseAudio / PipeWire (pipewire-pulse)
+                           └─ Bluetooth devices connected through BlueZ
+
+macOS: AppKit → Swift → AVFoundation / AVPlayer
+                       ├─ CoreAudio output discovery and UID routing
+                       └─ Apple's native AirPlay picker
+```
+
+mpv provides Linux streaming and per-process routing through its IPC/audio-device
+interface. AVFoundation provides macOS media controls, lifecycle and native routing
+APIs. Identical playback backends are not a design requirement: reliable native
+behavior takes priority. Neither implementation changes the global output as part
+of its direct per-player output selection.
+
+## Building / Testing
+
+Run Linux's headless regression tests and syntax checks from the repository root:
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m py_compile mpv-radio-tray
+```
+
+The tests simulate GTK, Bluetooth, audio-server responses and mpv. Linux-only
+parent-death tests run on Linux and are skipped on macOS. The remembered-Bluetooth
+acceptance test has also passed on the user's real Linux laptop; automated tests
+do not replace checks on other speakers/audio-server configurations.
+
+For macOS, use the maintained scripts with Swift warnings treated as errors:
+
+```sh
+./macos/scripts/build-app.sh
+./macos/scripts/check.sh
+./macos/scripts/check.sh --outputs
+./macos/scripts/check.sh --popover
+./macos/scripts/check.sh --stream https://netradio.live24.gr/galaxy9292
+./macos/scripts/check.sh --stream https://stream.radiojar.com/redfm963
+python3 macos/scripts/test-app-startup.py "macos/dist/MPV Radio Tray.app"
+```
+
+The core checks cover stations, playback intent/recovery and output models.
+Native checks require a logged-in graphical macOS session; they test output
+inventory, preferences, device changes, shared-player popover lifecycle, muted
+stream playback, media controls and clean shutdown. No receiver is selected
+automatically. Real sound, system media-command delivery and AirPlay routing
+require [manual acceptance](macos/README.md#manual-acceptance).
+
+On Linux, verify these after changing audio/routing code:
+
+1. Select a paired speaker once, play, Quit, relaunch, and start a station without
+   touching Output. Confirm speaker audio and **Bluetooth audio routed**.
+2. Repeat initially disconnected, then powered off. Check reconnection, bounded
+   failure, silence while waiting, the retained preference and a responsive tray.
+3. Power it on and retry; check station switching, manual re-selection and
+   watchdog restart retain routing. Stop/Quit must cancel pending work.
+4. Test Computer/System default and confirm other applications remain unchanged.
+
+Generated bundles, compiler caches and Python bytecode are ignored; tests/builds
+write temporary or ignored output. No third-party packages are downloaded by the
+macOS build scripts.
+
+## License
+
+This repository is licensed under the [MIT License](LICENSE). Station names,
+broadcasts and stream URLs belong to their respective providers; this project
+does not claim ownership of third-party radio content or guarantee availability.

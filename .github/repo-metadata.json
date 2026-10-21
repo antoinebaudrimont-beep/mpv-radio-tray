@@ -1,5 +1,5 @@
 {
-  "description": "Lightweight GTK tray application for streaming live radio on Linux. Uses mpv as the playback backend with automatic stream recovery, Bluetooth audio output support, and custom station configuration.",
+  "description": "Lightweight internet radio player for Linux and macOS: GTK/mpv on Linux, native AppKit/AVFoundation on macOS, with station lists, output selection and automatic recovery.",
   "topics": [
     "mpv",
     "radio-player",
@@ -10,6 +10,11 @@
     "xfce",
     "audio-player",
     "python",
-    "multimedia"
+    "multimedia",
+    "macos",
+    "swift",
+    "appkit",
+    "avfoundation",
+    "airplay"
   ]
 }

@@ -10,7 +10,7 @@ for the platform comparison and Linux instructions.
 
 - macOS 13 or later.
 - Apple Command Line Tools with Swift 5.9 or later (`xcode-select --install`).
-- No third-party packages, Homebrew mpv, or external playback executable.
+- No third-party packages or external playback executable are required.
 
 From the repository root:
 
@@ -115,9 +115,9 @@ CoreAudio listeners cover inventory/default output, name, UID, transport,
 output configuration and availability. Routing updates immediately; a root menu
 being tracked is rebuilt after it closes.
 
-The requested UID/name persist across station changes, recovery, Stop/start
-and sleep/wake. If a selected physical output disappears, it becomes
-**unavailable** and radio suspends. It resumes when that device returns unless
+The requested UID/name persist across application launches, station changes,
+recovery, Stop/start and sleep/wake. If a selected physical output disappears,
+it becomes **unavailable** and radio suspends. It resumes when that device returns unless
 Pause, Stop, sleep or shutdown prevents it. Choose System Default or another
 available output to resume on a different destination.
 
@@ -147,9 +147,9 @@ The external system-selector path has not been separately retested after that
 registration change. Receiver selection, availability and continuity depend on
 macOS and the receiver; a detector flag or requested UID is not proof of sound.
 
-If receivers are also missing from macOS's own AirPlay list, investigate system
-and local-network discovery. Refresh Outputs cannot restore system AirPlay
-discovery, and visibility in Spotify Connect does not establish AirPlay availability.
+Discovery has varied during testing, including receivers disappearing from
+macOS's own AirPlay list. A working local-network/system discovery path is
+required; Refresh Outputs cannot restore system AirPlay discovery.
 
 ## Recovery and resource use
 
